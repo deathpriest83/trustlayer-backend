@@ -47,8 +47,8 @@ app.post('/batch', async (req, res) => {
     const { data: countries } = await supabase.from('poster_countries').select('handle,country_code,source,confidence').in('handle', norm);
     const cMap = {};
     for (const c of (countries || [])) { if (!cMap[c.handle] || c.confidence > cMap[c.handle].confidence) cMap[c.handle] = c; }
-    const 90 = new Date(Date.now() - 90 * 86400000).toISOString();
-    let cnData = []; try { const r = await supabase.from('community_notes').select('handle,note_id,summary,created_at').in('handle', norm).gte('created_at', 90); cnData = r.data || []; } catch(e) {}
+    const d90 = new Date(Date.now() - 90 * 86400000).toISOString();
+    let cnData = []; try { const r = await supabase.from('community_notes').select('handle,note_id,summary,created_at').in('handle', norm).gte('created_at', d90); cnData = r.data || []; } catch(e) {}
     const cnMap = {};
     for (const cn of cnData) { if (!cnMap[cn.handle]) cnMap[cn.handle] = { count: 0, details: [] }; cnMap[cn.handle].count++; cnMap[cn.handle].details.push({ date: cn.created_at?.slice(0, 10), summary: cn.summary }); }
     let botData = []; try { const r = await supabase.from('bot_scores').select('handle,score,signals').in('handle', norm); botData = r.data || []; } catch(e) {}
