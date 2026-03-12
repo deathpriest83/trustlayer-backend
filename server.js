@@ -125,6 +125,42 @@ app.post('/detect-ai', async (req, res) => {
 });
 const P = process.env.PORT || 3000;
 
+// --- AI verdict endpoints ---
+app.post('/ai-verdict', async (req, res) => {
+  try {
+    const {tweet_id, handle, ai_score, grok_text, verdict} = req.body;
+    if (!tweet_id || !handle) return res.status(400).json({error:'tweet_id and handle required'});
+    const n = handle.toLowerCase().replace(/^@/,'');
+    await supabase.from('ai_verdicts').upsert({tweet_id, handle:n, ai_score:ai_score||0, grok_text:grok_text||null, verdict:verdict||null},{onConflict:'tweet_id'});
+    const {data:counts} = await supabase.from('ai_verdicts').select('ai_score').eq('handle',n);
+    if (counts && counts.length > 0) {
+      const total=counts.length, flagged=counts.filter(c=>c.ai_score>0.5).length;
+      await supabase.from('account_ai_scores').upsert({handle:n,total_analyzed:total,total_flagged:flagged,ai_ratio:flagged/total,last_updated:new Date().toISOString()},{onConflict:'handle'});
+    }
+    res.json({success:true});
+  } catch(e) { console.error('/ai-verdict',e); res.status(500).json({error:'internal error'}); }
+});
+
+app.post('/ai-verdict/check', async (req, res) => {
+  try {
+    const {tweet_ids} = req.body;
+    if (!tweet_ids || !Array.isArray(tweet_ids)) return res.json({verdicts:{}});
+    const {data} = await supabase.from('ai_verdicts').select('tweet_id,ai_score,verdict').in('tweet_id',tweet_ids.slice(0,50));
+    const map = {};
+    for (const v of (data||[])) map[v.tweet_id] = {ai_score:v.ai_score,verdict:v.verdict};
+    res.json({verdicts:map});
+  } catch(e) { res.status(500).json({error:'internal error'}); }
+});
+
+app.get('/ai-verdicts/:handle', async (req, res) => {
+  try {
+    const n = req.params.handle.toLowerCase().replace(/^@/,'');
+    const {data:verdicts} = await supabase.from('ai_verdicts').select('tweet_id,ai_score,verdict,created_at').eq('handle',n).order('created_at',{ascending:false}).limit(20);
+    const {data:account} = await supabase.from('account_ai_scores').select('*').eq('handle',n).limit(1);
+    res.json({verdicts:verdicts||[], account:account?.[0]||null});
+  } catch(e) { res.status(500).json({error:'internal error'}); }
+});
+
 // --- POST /seed --- trigger account location seeder ---
 const BEARER_TK = 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
 const Q_ID = 'zs_jFPFT78rBpXv9Z3U2YQ';
