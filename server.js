@@ -59,7 +59,7 @@ app.post('/batch', async (req, res) => {
       const pc = cMap[h]?.country_code || null;
       const s = filterScores(hR, pc, settings);
       const cn = cnMap[h]; const bot = bMap[h];
-      results[h] = { trusted: s.trusted, distrusted: s.distrusted, total: s.total, country: pc, countrySource: cMap[h]?.source || null, countryConfidence: cMap[h]?.confidence || null, freedomStatus: getFreedomStatus(pc), aiProb: null, botScore: bot?.score ?? null, botSignals: bot?.signals ?? null, communityNotes: cn?.count ?? null, communityNotesDetails: cn?.details?.slice(0, 5) ?? null };
+      results[h] = { trusted: s.trusted, distrusted: s.distrusted, total: s.total, country: pc, countrySource: cMap[h]?.source || null, countryConfidence: cMap[h]?.confidence || null, freedomStatus: getFreedomStatus(pc), aiProb: null, botScore: bot?.score ?? null, botSignals: bot?.signals ?? null, communityNotes: cn?.count ?? null, communityNotesDetails: cn?.details?.slice(0, 5) ?? null, accountAiRatio: null };
     }
     res.json({ results });
   } catch (err) { console.error('/batch', err); res.status(500).json({ error: 'internal error' }); }
@@ -202,5 +202,46 @@ async function autoSeed() {
 }
 setInterval(autoSeed, 5 * 60 * 1000);
 setTimeout(autoSeed, 30000);
+
+// --- POST /ai-verdict --- store Grok AI analysis verdict ---
+app.post('/ai-verdict', async (req, res) => {
+  try {
+    const { tweet_id, handle, ai_probability, grok_text, verdict, reported_by } = req.body;
+    if (!tweet_id || !handle || !verdict) return res.status(400).json({error: 'tweet_id, handle, verdict required'});
+    const n = handle.toLowerCase().replace(/^@/, '');
+    
+    // Store individual verdict
+    await supabase.from('ai_verdicts').upsert({
+      tweet_id, handle: n, verdict, confidence: ai_probability || null,
+      grok_text: (grok_text || '').substring(0, 500), source: 'grok_reply'
+    }, {onConflict: 'tweet_id'});
+    
+    // Update account AI score
+    const {data: verdicts} = await supabase.from('ai_verdicts').select('verdict').eq('handle', n);
+    if (verdicts && verdicts.length > 0) {
+      const total = verdicts.length;
+      const flagged = verdicts.filter(v => v.verdict === 'ai_likely').length;
+      const ratio = total > 0 ? flagged / total : 0;
+      await supabase.from('account_ai_scores').upsert({
+        handle: n, total_analyzed: total, total_ai_flagged: flagged,
+        ai_ratio: Math.round(ratio * 100) / 100,
+        last_verdict_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }, {onConflict: 'handle'});
+    }
+    
+    res.json({success: true, tweet_id, handle: n, verdict});
+  } catch(err) { console.error('/ai-verdict', err); res.status(500).json({error: 'internal error'}); }
+});
+
+// --- GET /ai-score/:handle --- get account AI posting ratio ---
+app.get('/ai-score/:handle', async (req, res) => {
+  try {
+    const n = req.params.handle.toLowerCase().replace(/^@/, '');
+    const {data} = await supabase.from('account_ai_scores').select('*').eq('handle', n).limit(1);
+    if (data && data.length > 0) res.json(data[0]);
+    else res.json({handle: n, total_analyzed: 0, total_ai_flagged: 0, ai_ratio: 0});
+  } catch(err) { res.status(500).json({error: 'internal error'}); }
+});
 
 app.listen(P, () => console.log(`TrustLayer backend v3 running on port ${P}`));
