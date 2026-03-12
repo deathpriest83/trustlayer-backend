@@ -125,58 +125,6 @@ app.post('/detect-ai', async (req, res) => {
 });
 const P = process.env.PORT || 3000;
 
-// --- POST /scan-media --- auto-scan images/videos via Sightengine with caching ---
-app.post('/scan-media', async (req, res) => {
-  try {
-    const {media_url, tweet_id, handle} = req.body;
-    if (!media_url) return res.status(400).json({error:'media_url required'});
-    const urlHash = Buffer.from(media_url).toString('base64').slice(0,100);
-    // Check cache first
-    const {data:cached} = await supabase.from('ai_verdicts').select('ai_score,verdict').eq('tweet_id',urlHash).limit(1);
-    if (cached && cached.length > 0) return res.json({ai_score:cached[0].ai_score, verdict:cached[0].verdict, cached:true});
-    // Call Sightengine
-    const U = process.env.SIGHTENGINE_USER, S = process.env.SIGHTENGINE_SECRET;
-    if (!U || !S) return res.json({ai_score:null, verdict:'not_configured', cached:false});
-    const seUrl = `https://api.sightengine.com/1.0/check.json?url=${encodeURIComponent(media_url)}&models=genai&api_user=${U}&api_secret=${S}`;
-    const seRes = await fetch(seUrl);
-    const seData = await seRes.json();
-    let aiScore = 0, verdict = 'authentic';
-    if (seData && seData.type) {
-      aiScore = seData.type.ai_generated || 0;
-      verdict = aiScore > 0.7 ? 'ai_likely' : aiScore > 0.3 ? 'possibly_ai' : 'authentic';
-    }
-    // Cache result
-    await supabase.from('ai_verdicts').upsert({tweet_id:urlHash, handle:(handle||'unknown').toLowerCase(), ai_score:aiScore, verdict:verdict, grok_text:'sightengine:'+media_url.slice(0,200)},{onConflict:'tweet_id'});
-    // Update account AI score
-    if (handle) {
-      const n = handle.toLowerCase();
-      const {data:counts} = await supabase.from('ai_verdicts').select('ai_score').eq('handle',n);
-      if (counts && counts.length > 0) {
-        const total=counts.length, flagged=counts.filter(c=>c.ai_score>0.5).length;
-        await supabase.from('account_ai_scores').upsert({handle:n,total_analyzed:total,total_flagged:flagged,ai_ratio:flagged/total,last_updated:new Date().toISOString()},{onConflict:'handle'});
-      }
-    }
-    res.json({ai_score:aiScore, verdict:verdict, cached:false});
-  } catch(e) { console.error('/scan-media',e); res.status(500).json({error:'internal error'}); }
-});
-
-// --- POST /scan-media/batch --- check multiple media URLs at once (cached only) ---
-app.post('/scan-media/batch', async (req, res) => {
-  try {
-    const {media_urls} = req.body;
-    if (!media_urls || !Array.isArray(media_urls)) return res.json({results:{}});
-    const hashes = media_urls.slice(0,50).map(u => ({url:u, hash:Buffer.from(u).toString('base64').slice(0,100)}));
-    const hashList = hashes.map(h => h.hash);
-    const {data} = await supabase.from('ai_verdicts').select('tweet_id,ai_score,verdict').in('tweet_id',hashList);
-    const map = {};
-    for (const h of hashes) {
-      const found = (data||[]).find(d => d.tweet_id === h.hash);
-      if (found) map[h.url] = {ai_score:found.ai_score, verdict:found.verdict, cached:true};
-    }
-    res.json({results:map});
-  } catch(e) { res.status(500).json({error:'internal error'}); }
-});
-
 // --- AI verdict endpoints ---
 app.post('/ai-verdict', async (req, res) => {
   try {
@@ -211,6 +159,100 @@ app.get('/ai-verdicts/:handle', async (req, res) => {
     const {data:account} = await supabase.from('account_ai_scores').select('*').eq('handle',n).limit(1);
     res.json({verdicts:verdicts||[], account:account?.[0]||null});
   } catch(e) { res.status(500).json({error:'internal error'}); }
+});
+
+// --- VOTING SYSTEM: crowdsourced AI detection with voter reliability ---
+
+// Setup tables (call once)
+app.post('/setup-voting', async (req, res) => {
+  try {
+    await supabase.rpc('exec_sql', {query: "CREATE TABLE IF NOT EXISTS media_votes (id SERIAL PRIMARY KEY, media_url_hash TEXT NOT NULL, user_id TEXT NOT NULL, vote TEXT NOT NULL, tweet_id TEXT, handle TEXT, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(media_url_hash, user_id))"}).catch(()=>{});
+    await supabase.rpc('exec_sql', {query: "CREATE TABLE IF NOT EXISTS media_verdicts (media_url_hash TEXT PRIMARY KEY, total_votes INT DEFAULT 0, ai_votes INT DEFAULT 0, real_votes INT DEFAULT 0, weighted_ai_score REAL DEFAULT 0, sample_handle TEXT, updated_at TIMESTAMPTZ DEFAULT now())"}).catch(()=>{});
+    await supabase.rpc('exec_sql', {query: "CREATE TABLE IF NOT EXISTS voter_reliability (user_id TEXT PRIMARY KEY, total_votes INT DEFAULT 0, aligned_votes INT DEFAULT 0, reliability_score REAL DEFAULT 1.0, updated_at TIMESTAMPTZ DEFAULT now())"}).catch(()=>{});
+    // Fallback: create via REST
+    res.json({message: 'Run SQL manually in Supabase if tables not created via rpc'});
+  } catch(e) { res.json({error: e.message}); }
+});
+
+// POST /vote-media - submit AI/real vote on media
+app.post('/vote-media', async (req, res) => {
+  try {
+    const {media_url, vote, user_id, tweet_id, handle} = req.body;
+    if (!media_url || !vote || !user_id) return res.status(400).json({error: 'media_url, vote, user_id required'});
+    if (vote !== 'ai' && vote !== 'real') return res.status(400).json({error: 'vote must be ai or real'});
+    const urlHash = Buffer.from(media_url.split('?')[0]).toString('base64').slice(0,100);
+    // Upsert vote
+    const {error: vErr} = await supabase.from('media_votes').upsert({media_url_hash: urlHash, user_id, vote, tweet_id: tweet_id||null, handle: (handle||'').toLowerCase()}, {onConflict: 'media_url_hash,user_id'});
+    if (vErr) { console.error('vote err', vErr); return res.status(500).json({error: 'vote failed'}); }
+    // Get voter reliability
+    const {data: voterData} = await supabase.from('voter_reliability').select('reliability_score').eq('user_id', user_id).limit(1);
+    const voterReliability = voterData && voterData.length > 0 ? voterData[0].reliability_score : 1.0;
+    // Recalculate verdict
+    const {data: allVotes} = await supabase.from('media_votes').select('vote,user_id').eq('media_url_hash', urlHash);
+    if (!allVotes) return res.json({success: true});
+    let aiW = 0, realW = 0, aiC = 0, realC = 0;
+    for (const v of allVotes) {
+      // Get each voter's reliability
+      let rel = 1.0;
+      if (v.user_id === user_id) rel = voterReliability;
+      else {
+        const {data: vr} = await supabase.from('voter_reliability').select('reliability_score').eq('user_id', v.user_id).limit(1);
+        if (vr && vr.length > 0) rel = vr[0].reliability_score;
+      }
+      if (v.vote === 'ai') { aiW += rel; aiC++; }
+      else { realW += rel; realC++; }
+    }
+    const total = aiC + realC;
+    const weightedScore = total > 0 ? aiW / (aiW + realW) : 0;
+    await supabase.from('media_verdicts').upsert({media_url_hash: urlHash, total_votes: total, ai_votes: aiC, real_votes: realC, weighted_ai_score: weightedScore, sample_handle: (handle||'').toLowerCase(), updated_at: new Date().toISOString()}, {onConflict: 'media_url_hash'});
+    // Update voter reliability if consensus exists (5+ votes, 70%+ agreement)
+    if (total >= 5) {
+      const consensusIsAI = weightedScore > 0.7;
+      const consensusIsReal = weightedScore < 0.3;
+      if (consensusIsAI || consensusIsReal) {
+        for (const v of allVotes) {
+          const aligned = (consensusIsAI && v.vote === 'ai') || (consensusIsReal && v.vote === 'real');
+          const {data: existing} = await supabase.from('voter_reliability').select('*').eq('user_id', v.user_id).limit(1);
+          if (existing && existing.length > 0) {
+            const e = existing[0];
+            const newAligned = aligned ? e.aligned_votes + 1 : e.aligned_votes;
+            const newTotal = e.total_votes + 1;
+            const newScore = Math.max(0.1, Math.min(2.0, newAligned / newTotal));
+            await supabase.from('voter_reliability').update({aligned_votes: newAligned, total_votes: newTotal, reliability_score: newScore, updated_at: new Date().toISOString()}).eq('user_id', v.user_id);
+          } else {
+            await supabase.from('voter_reliability').insert({user_id: v.user_id, total_votes: 1, aligned_votes: aligned ? 1 : 0, reliability_score: aligned ? 1.0 : 0.5, updated_at: new Date().toISOString()});
+          }
+        }
+      }
+    }
+    res.json({success: true, verdict: {total_votes: total, ai_votes: aiC, real_votes: realC, weighted_ai_score: weightedScore}});
+  } catch(e) { console.error('/vote-media', e); res.status(500).json({error: 'internal error'}); }
+});
+
+// POST /media-scores/batch - check AI scores for multiple media URLs
+app.post('/media-scores/batch', async (req, res) => {
+  try {
+    const {media_urls} = req.body;
+    if (!media_urls || !Array.isArray(media_urls)) return res.json({results: {}});
+    const hashes = media_urls.slice(0, 50).map(u => ({url: u, hash: Buffer.from(u.split('?')[0]).toString('base64').slice(0,100)}));
+    const hashList = hashes.map(h => h.hash);
+    const {data} = await supabase.from('media_verdicts').select('*').in('media_url_hash', hashList);
+    const map = {};
+    for (const h of hashes) {
+      const found = (data||[]).find(d => d.media_url_hash === h.hash);
+      if (found) map[h.url] = {total_votes: found.total_votes, ai_votes: found.ai_votes, real_votes: found.real_votes, weighted_ai_score: found.weighted_ai_score};
+    }
+    res.json({results: map});
+  } catch(e) { res.status(500).json({error: 'internal error'}); }
+});
+
+// GET /voter/:user_id - get voter reliability
+app.get('/voter/:user_id', async (req, res) => {
+  try {
+    const {data} = await supabase.from('voter_reliability').select('*').eq('user_id', req.params.user_id).limit(1);
+    if (data && data.length > 0) res.json(data[0]);
+    else res.json({user_id: req.params.user_id, total_votes: 0, aligned_votes: 0, reliability_score: 1.0});
+  } catch(e) { res.status(500).json({error: 'internal error'}); }
 });
 
 // --- POST /seed --- trigger account location seeder ---
