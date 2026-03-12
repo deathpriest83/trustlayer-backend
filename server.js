@@ -231,7 +231,25 @@ app.post('/ai-verdict', async (req, res) => {
     }
     
     res.json({success: true, tweet_id, handle: n, verdict});
-  } catch(err) { console.error('/ai-verdict', err); res.status(500).json({error: 'internal error'}); }
+  } catch(err) { console.error('/ai-verdict', err); res.status(500).json({error: 'internal error'});
+app.post('/ai-verdict/check', async (req, res) => {
+  try {
+    const {tweet_ids} = req.body;
+    if (!tweet_ids) return res.json({verdicts:{}});
+    const {data} = await supabase.from('ai_verdicts').select('tweet_id,ai_score,verdict').in('tweet_id',tweet_ids.slice(0,50));
+    const map = {}; for (const v of (data||[])) map[v.tweet_id] = {ai_score:v.ai_score,verdict:v.verdict};
+    res.json({verdicts:map});
+  } catch(e) { res.status(500).json({error:'internal error'}); }
+});
+app.get('/ai-account/:handle', async (req, res) => {
+  try {
+    const n = req.params.handle.toLowerCase().replace(/^@/,'');
+    const {data} = await supabase.from('account_ai_scores').select('*').eq('handle',n).limit(1);
+    if (data && data.length > 0) res.json(data[0]);
+    else res.json({handle:n, total_analyzed:0, total_flagged:0, ai_ratio:0});
+  } catch(e) { res.status(500).json({error:'internal error'}); }
+});
+ }
 });
 
 // --- GET /ai-score/:handle --- get account AI posting ratio ---
