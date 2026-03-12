@@ -124,4 +124,41 @@ app.post('/detect-ai', async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'internal error' }); }
 });
 const P = process.env.PORT || 3000;
+
+// --- POST /seed --- trigger account location seeder ---
+const BEARER_TK = 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
+const Q_ID = 'zs_jFPFT78rBpXv9Z3U2YQ';
+const C2C = {'united states':'US','united kingdom':'GB','canada':'CA','australia':'AU','germany':'DE','france':'FR','netherlands':'NL','japan':'JP','south korea':'KR','italy':'IT','spain':'ES','argentina':'AR','south africa':'ZA','india':'IN','brazil':'BR','mexico':'MX','russia':'RU','china':'CN','iran':'IR','saudi arabia':'SA','united arab emirates':'AE','turkey':'TR','thailand':'TH','vietnam':'VN','egypt':'EG','pakistan':'PK','israel':'IL','greece':'GR','romania':'RO','singapore':'SG','malaysia':'MY','hong kong':'HK'};
+const R2C = {'eastern europe (non-eu)':'R_EE_NONEU','southeast asia':'R_SEA','south asia':'R_SA','east asia':'R_EA','middle east':'R_ME','sub-saharan africa':'R_SSA','north america':'R_NAM','south america':'R_SAM','oceania':'R_OCE'};
+function resLoc(raw){if(!raw)return null;var l=raw.toLowerCase().trim();if(R2C[l])return{code:R2C[l],isRegion:true};if(C2C[l])return{code:C2C[l],isRegion:false};return null;}
+app.post('/seed', async (req, res) => {
+  const ct0=process.env.SCRAPER_CT0, authTk=process.env.SCRAPER_AUTH_TOKEN;
+  if(!ct0||!authTk) return res.json({error:'no scraper cookies'});
+  const limit=req.body.limit||50;
+  const {data:queue}=await supabase.from('seeder_queue').select('handle').eq('scraped',false).order('priority',{ascending:false}).limit(limit);
+  if(!queue||queue.length===0) return res.json({message:'queue empty'});
+  res.json({message:'seeding started',handles:queue.length});
+  let scraped=0,saved=0;
+  for(const item of queue){
+    try{
+      const url='https://x.com/i/api/graphql/'+Q_ID+'/AboutAccountQuery?variables='+encodeURIComponent(JSON.stringify({screenName:item.handle}));
+      const r=await fetch(url,{headers:{'authorization':BEARER_TK,'x-csrf-token':ct0,'cookie':'ct0='+ct0+'; auth_token='+authTk,'x-twitter-auth-type':'OAuth2Session','x-twitter-active-user':'yes','content-type':'application/json','user-agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}});
+      if(r.status===429){console.log('[Seed] Rate limited');await new Promise(w=>setTimeout(w,60000));continue;}
+      if(!r.ok){await supabase.from('seeder_queue').update({scraped:true}).eq('handle',item.handle);continue;}
+      const json=await r.json();let about;try{about=json.data.user_result_by_screen_name.result.about_profile;}catch(e){}
+      scraped++;
+      if(about){
+        let cc=null,src=null,conf=0,rawLoc=null;
+        if(about.source){const m=about.source.match(/^(.+?)\s*App Store/i);if(m){const rl=resLoc(m[1].replace(/^U\.S\.$/,'United States'));if(rl&&!rl.isRegion){cc=rl.code;src='app_store';conf=1.0;rawLoc=about.source;}}}
+        if(!cc&&about.account_based_in){const rl=resLoc(about.account_based_in);if(rl){cc=rl.code;src=rl.isRegion?'account_based_in_region':'account_based_in';conf=rl.isRegion?0.7:0.95;rawLoc=about.account_based_in;}}
+        if(cc){await supabase.from('poster_countries').upsert({handle:item.handle.toLowerCase(),country_code:cc,source:src,confidence:conf,submission_count:1,raw_location:rawLoc,vpn_warning:about.location_accurate===false},{onConflict:'handle'});saved++;console.log('[Seed] '+scraped+' @'+item.handle+': '+cc);}
+        else console.log('[Seed] '+scraped+' @'+item.handle+': no location');
+      }
+      await supabase.from('seeder_queue').update({scraped:true}).eq('handle',item.handle);
+      await new Promise(w=>setTimeout(w,5000));
+    }catch(e){console.log('[Seed] Error:',e.message);await new Promise(w=>setTimeout(w,10000));}
+  }
+  console.log('[Seed] Done. Scraped:'+scraped+' Saved:'+saved);
+});
+
 app.listen(P, () => console.log(`TrustLayer backend v3 running on port ${P}`));
