@@ -125,6 +125,58 @@ app.post('/detect-ai', async (req, res) => {
 });
 const P = process.env.PORT || 3000;
 
+// --- POST /scan-media --- auto-scan images/videos via Sightengine with caching ---
+app.post('/scan-media', async (req, res) => {
+  try {
+    const {media_url, tweet_id, handle} = req.body;
+    if (!media_url) return res.status(400).json({error:'media_url required'});
+    const urlHash = Buffer.from(media_url).toString('base64').slice(0,100);
+    // Check cache first
+    const {data:cached} = await supabase.from('ai_verdicts').select('ai_score,verdict').eq('tweet_id',urlHash).limit(1);
+    if (cached && cached.length > 0) return res.json({ai_score:cached[0].ai_score, verdict:cached[0].verdict, cached:true});
+    // Call Sightengine
+    const U = process.env.SIGHTENGINE_USER, S = process.env.SIGHTENGINE_SECRET;
+    if (!U || !S) return res.json({ai_score:null, verdict:'not_configured', cached:false});
+    const seUrl = `https://api.sightengine.com/1.0/check.json?url=${encodeURIComponent(media_url)}&models=genai&api_user=${U}&api_secret=${S}`;
+    const seRes = await fetch(seUrl);
+    const seData = await seRes.json();
+    let aiScore = 0, verdict = 'authentic';
+    if (seData && seData.type) {
+      aiScore = seData.type.ai_generated || 0;
+      verdict = aiScore > 0.7 ? 'ai_likely' : aiScore > 0.3 ? 'possibly_ai' : 'authentic';
+    }
+    // Cache result
+    await supabase.from('ai_verdicts').upsert({tweet_id:urlHash, handle:(handle||'unknown').toLowerCase(), ai_score:aiScore, verdict:verdict, grok_text:'sightengine:'+media_url.slice(0,200)},{onConflict:'tweet_id'});
+    // Update account AI score
+    if (handle) {
+      const n = handle.toLowerCase();
+      const {data:counts} = await supabase.from('ai_verdicts').select('ai_score').eq('handle',n);
+      if (counts && counts.length > 0) {
+        const total=counts.length, flagged=counts.filter(c=>c.ai_score>0.5).length;
+        await supabase.from('account_ai_scores').upsert({handle:n,total_analyzed:total,total_flagged:flagged,ai_ratio:flagged/total,last_updated:new Date().toISOString()},{onConflict:'handle'});
+      }
+    }
+    res.json({ai_score:aiScore, verdict:verdict, cached:false});
+  } catch(e) { console.error('/scan-media',e); res.status(500).json({error:'internal error'}); }
+});
+
+// --- POST /scan-media/batch --- check multiple media URLs at once (cached only) ---
+app.post('/scan-media/batch', async (req, res) => {
+  try {
+    const {media_urls} = req.body;
+    if (!media_urls || !Array.isArray(media_urls)) return res.json({results:{}});
+    const hashes = media_urls.slice(0,50).map(u => ({url:u, hash:Buffer.from(u).toString('base64').slice(0,100)}));
+    const hashList = hashes.map(h => h.hash);
+    const {data} = await supabase.from('ai_verdicts').select('tweet_id,ai_score,verdict').in('tweet_id',hashList);
+    const map = {};
+    for (const h of hashes) {
+      const found = (data||[]).find(d => d.tweet_id === h.hash);
+      if (found) map[h.url] = {ai_score:found.ai_score, verdict:found.verdict, cached:true};
+    }
+    res.json({results:map});
+  } catch(e) { res.status(500).json({error:'internal error'}); }
+});
+
 // --- AI verdict endpoints ---
 app.post('/ai-verdict', async (req, res) => {
   try {
