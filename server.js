@@ -161,4 +161,46 @@ app.post('/seed', async (req, res) => {
   console.log('[Seed] Done. Scraped:'+scraped+' Saved:'+saved);
 });
 
+// --- POST /seed/add --- extension adds handles to scrape queue ---
+app.post('/seed/add', async (req, res) => {
+  const { handles } = req.body;
+  if (!handles || !Array.isArray(handles) || handles.length === 0) return res.json({added: 0});
+  const rows = handles.slice(0, 50).map(h => ({handle: h.toLowerCase().replace(/^@/,''), priority: 10, scraped: false}));
+  const { error } = await supabase.from('seeder_queue').upsert(rows, {onConflict: 'handle', ignoreDuplicates: true});
+  if (error) console.log('[Seed/add] Error:', error.message);
+  res.json({added: rows.length});
+});
+
+// --- Auto-seeder: process queue every 5 minutes ---
+let seederRunning = false;
+async function autoSeed() {
+  if (seederRunning) return;
+  const ct0 = process.env.SCRAPER_CT0, authTk = process.env.SCRAPER_AUTH_TOKEN;
+  if (!ct0 || !authTk) return;
+  const {data: queue} = await supabase.from('seeder_queue').select('handle').eq('scraped', false).order('priority', {ascending: false}).limit(10);
+  if (!queue || queue.length === 0) return;
+  seederRunning = true;
+  console.log('[AutoSeed] Processing ' + queue.length + ' handles...');
+  for (const item of queue) {
+    try {
+      const url = 'https://x.com/i/api/graphql/' + Q_ID + '/AboutAccountQuery?variables=' + encodeURIComponent(JSON.stringify({screenName: item.handle}));
+      const r = await fetch(url, {headers: {'authorization': BEARER_TK, 'x-csrf-token': ct0, 'cookie': 'ct0=' + ct0 + '; auth_token=' + authTk, 'x-twitter-auth-type': 'OAuth2Session', 'x-twitter-active-user': 'yes', 'content-type': 'application/json', 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}});
+      if (r.status === 429) { console.log('[AutoSeed] Rate limited, stopping'); break; }
+      if (!r.ok) { await supabase.from('seeder_queue').update({scraped: true}).eq('handle', item.handle); continue; }
+      const json = await r.json(); let about; try { about = json.data.user_result_by_screen_name.result.about_profile; } catch(e) {}
+      if (about) {
+        let cc = null, src = null, conf = 0, rawLoc = null;
+        if (about.source) { const m = about.source.match(/^(.+?)\s*App Store/i); if (m) { const rl = resLoc(m[1].replace(/^U\.S\.$/,'United States')); if (rl && !rl.isRegion) { cc=rl.code; src='app_store'; conf=1.0; rawLoc=about.source; }}}
+        if (!cc && about.account_based_in) { const rl = resLoc(about.account_based_in); if (rl) { cc=rl.code; src=rl.isRegion?'account_based_in_region':'account_based_in'; conf=rl.isRegion?0.7:0.95; rawLoc=about.account_based_in; }}
+        if (cc) { await supabase.from('poster_countries').upsert({handle: item.handle.toLowerCase(), country_code: cc, source: src, confidence: conf, submission_count: 1, raw_location: rawLoc, vpn_warning: about.location_accurate===false}, {onConflict: 'handle'}); console.log('[AutoSeed] @' + item.handle + ': ' + cc); }
+      }
+      await supabase.from('seeder_queue').update({scraped: true}).eq('handle', item.handle);
+      await new Promise(w => setTimeout(w, 5000));
+    } catch(e) { console.log('[AutoSeed] Error:', e.message); }
+  }
+  seederRunning = false;
+}
+setInterval(autoSeed, 5 * 60 * 1000);
+setTimeout(autoSeed, 30000);
+
 app.listen(P, () => console.log(`TrustLayer backend v3 running on port ${P}`));
