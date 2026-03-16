@@ -391,5 +391,7 @@ app.get('/ai-score/:handle', async (req, res) => {
     else res.json({handle: n, total_analyzed: 0, total_ai_flagged: 0, ai_ratio: 0});
   } catch(err) { res.status(500).json({error: 'internal error'}); }
 });
+const votingRoutes = require('./voting');
+app.use('/', votingRoutes);
 
 app.listen(P, () => console.log(`TrustLayer backend v3 running on port ${P}`));
