@@ -118,6 +118,33 @@ router.get('/ai-verdict/check', async (req, res) => {
     if (!data) return res.json({ found: false });
     res.json({ found: true, ai_score: data.ai_score, verdict: data.verdict, total_votes: data.total_votes, min_votes_met: data.min_votes_met });
   } catch (err) { console.error('GET /ai-verdict/check error:', err); res.status(500).json({ error: 'Internal server error' }); }
+
+// POST /cn-report — receive community notes sightings from extension
+router.post('/cn-report', async (req, res) => {
+  try {
+    const { notes } = req.body;
+    if (!notes || !Array.isArray(notes) || notes.length === 0) return res.status(400).json({ error: 'notes array required' });
+    const rows = notes.slice(0, 50).map(n => ({ handle: (n.handle || '').toLowerCase(), tweet_id: n.tweet_id, note_type: n.note_type || 'shown', reporter_id: n.reporter_id || 'anon', created_at: new Date().toISOString() })).filter(r => r.handle && r.tweet_id);
+    if (rows.length === 0) return res.status(400).json({ error: 'no valid notes' });
+    const { error } = await supabase.from('community_notes_sightings').upsert(rows, { onConflict: 'tweet_id,reporter_id', ignoreDuplicates: true });
+    if (error) throw error;
+    res.json({ success: true, inserted: rows.length });
+  } catch (err) { console.error('POST /cn-report error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// POST /cn-counts — get community notes counts per handle (90 days)
+router.post('/cn-counts', async (req, res) => {
+  try {
+    const { handles } = req.body;
+    if (!handles || !Array.isArray(handles)) return res.status(400).json({ error: 'handles array required' });
+    const lower = handles.slice(0, 100).map(h => h.toLowerCase());
+    const { data, error } = await supabase.from('community_notes_90d').select('*').in('handle', lower);
+    if (error) throw error;
+    const results = {};
+    for (const r of (data || [])) results[r.handle] = { count: r.note_count, shown: r.shown_count, proposed: r.proposed_count };
+    res.json({ results });
+  } catch (err) { console.error('POST /cn-counts error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
 });
 
 module.exports = router;
